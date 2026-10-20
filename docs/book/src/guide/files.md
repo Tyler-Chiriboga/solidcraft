@@ -35,8 +35,11 @@ mirrored nodes are baked into their meshes. Compressed meshes (Draco, meshopt) a
 message: save the file uncompressed first.
 
 A 3MF project saved by a slicer comes in too, also when it keeps its objects in model parts of
-their own inside the file (the 3MF Production extension): each object on the build plate becomes
-a mesh body, with its parts where the slicer placed them.
+their own inside the file (the 3MF Production extension): each object on the build plates becomes
+one mesh body, with all its volumes merged where the slicer placed them. Slicer-only data
+(modifier, negative and support volumes, painting, per-object settings, and names kept in the
+slicer's metadata) is not read: modifier and negative volumes come in as ordinary solid geometry,
+and objects without a name in the model itself are called Mesh1, Mesh2, …
 
 **File → Save as mesh…** (also on the Mesh tab under Modify, and in the right-click menu of a
 body) saves the selected bodies as STL, 3MF or 3MF with face tags (below). With **Send to slicer** ticked, it writes the file to
