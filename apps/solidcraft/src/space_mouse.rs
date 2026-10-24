@@ -536,8 +536,10 @@ impl ReportSource for hidapi::HidDevice {
 /// What following the candidates tells the reader.
 #[cfg(any(target_os = "windows", target_os = "macos", test))]
 enum Followed<'a> {
-    /// This device is the one read now, so its calibration applies.
-    Device((u16, u16)),
+    /// This device is the one read now, so its calibration applies. With the buttons it last
+    /// reported down, when it reported them while another was read: they are its baseline, so a
+    /// press that makes it the device in use counts as a press, not as a button already held.
+    Device((u16, u16), Option<u32>),
     /// An input report from it.
     Report(&'a Layout, &'a [u8]),
     /// It is gone.
@@ -560,10 +562,12 @@ fn shows_use(layout: Layout, report: &[u8]) -> bool {
 #[cfg(any(target_os = "windows", target_os = "macos", test))]
 fn follow<D: ReportSource>(mut candidates: Vec<Candidate<D>>, now: impl Fn() -> Instant, mut emit: impl FnMut(Followed<'_>)) {
     let Some(first) = candidates.first() else { return };
-    emit(Followed::Device(first.ids));
+    emit(Followed::Device(first.ids, None));
     let mut followed = 0;
     // When the followed device last showed use.
     let mut used_at: Option<Instant> = None;
+    // The buttons each candidate last reported down, by index, as long as it has reported them.
+    let mut buttons: Vec<Option<u32>> = candidates.iter().map(|_| None).collect();
     let mut report = [0_u8; REPORT_BUFFER_BYTES];
     while !candidates.is_empty() {
         // One device is waited on as before; several take turns, briefly, so none waits behind
@@ -575,13 +579,17 @@ fn follow<D: ReportSource>(mut candidates: Vec<Candidate<D>>, now: impl Fn() -> 
                 Ok(0) => {}
                 Ok(size) => {
                     let bytes = report.get(..size).unwrap_or_default();
+                    let before = buttons.get(index).copied().flatten();
+                    if let (Some(seen), Some(down)) = (buttons.get_mut(index), candidate.layout.decode(bytes).and_then(|decoded| decoded.buttons)) {
+                        *seen = Some(down);
+                    }
                     if shows_use(candidate.layout, bytes) {
                         let at = now();
                         if index != followed && used_at.is_none_or(|used| at.duration_since(used) >= STALE_AFTER) {
                             let (vendor, product) = candidate.ids;
                             log::info!("3D mouse: reading {vendor:04x}:{product:04x}, the device in use");
                             followed = index;
-                            emit(Followed::Device(candidate.ids));
+                            emit(Followed::Device(candidate.ids, before));
                         }
                         if index == followed {
                             used_at = Some(at);
@@ -594,12 +602,15 @@ fn follow<D: ReportSource>(mut candidates: Vec<Candidate<D>>, now: impl Fn() -> 
                 Err(error) => {
                     log::info!("3D mouse disconnected: {error}");
                     candidates.remove(index);
+                    if index < buttons.len() {
+                        buttons.remove(index);
+                    }
                     if index == followed {
                         emit(Followed::Gone);
                         followed = 0;
                         used_at = None;
                         if let Some(next) = candidates.first() {
-                            emit(Followed::Device(next.ids));
+                            emit(Followed::Device(next.ids, buttons.first().copied().flatten()));
                         }
                     } else if index < followed {
                         followed -= 1;
@@ -639,7 +650,15 @@ fn reader(ctx: Context, shared: Arc<Mutex<Reading>>) {
             })
             .collect();
         follow(open, Instant::now, |event| match event {
-            Followed::Device(ids) => connected(&ctx, &shared, Source::Hid(Some(ids))),
+            Followed::Device(ids, buttons) => {
+                connected(&ctx, &shared, Source::Hid(Some(ids)));
+                // Taken over from another device: what it reported meanwhile is its baseline.
+                if let Some(buttons) = buttons
+                    && let Ok(mut reading) = shared.lock()
+                {
+                    reading.set_buttons(buttons);
+                }
+            }
             Followed::Report(layout, report) => publish(&ctx, &shared, *layout, report),
             Followed::Gone => reset(&ctx, &shared),
         });
@@ -1401,6 +1420,8 @@ mod tests {
     enum Seen {
         /// The product id now read.
         Device(u16),
+        /// The buttons it had reported down before it was read, its baseline.
+        Baseline(u32),
         /// A report published, the product id read when it was, and whether it showed use.
         Report(u16, Vec<u8>, bool),
         Gone,
@@ -1409,6 +1430,11 @@ mod tests {
     /// Follows simulated devices, given as (product id, scripted steps in ms), and returns what
     /// the reader was told.
     fn follow_simulated(devices: &[(u16, &[(u64, &[u8])])]) -> Vec<Seen> {
+        follow_simulated_with(Layout::default(), devices)
+    }
+
+    /// As `follow_simulated`, with every device's reports laid out as `layout`.
+    fn follow_simulated_with(layout: Layout, devices: &[(u16, &[(u64, &[u8])])]) -> Vec<Seen> {
         let start = Instant::now();
         let clock = std::cell::Cell::new(start);
         let candidates = devices
@@ -1419,7 +1445,7 @@ mod tests {
                     start,
                     steps: std::cell::RefCell::new(steps.iter().map(|(ms, bytes)| (*ms, bytes.to_vec())).collect()),
                 },
-                layout: Layout::default(),
+                layout,
                 ids: (0x256f, *product),
             })
             .collect();
@@ -1428,9 +1454,10 @@ mod tests {
             candidates,
             || clock.get(),
             |event| match event {
-                Followed::Device((_, product)) => {
+                Followed::Device((_, product), buttons) => {
                     read = product;
                     seen.push(Seen::Device(product));
+                    seen.extend(buttons.map(Seen::Baseline));
                 }
                 Followed::Report(layout, bytes) => seen.push(Seen::Report(read, bytes.to_vec(), shows_use(*layout, bytes))),
                 Followed::Gone => seen.push(Seen::Gone),
@@ -1511,6 +1538,32 @@ mod tests {
             [Seen::Device(SPACEMOUSE), Seen::Gone, Seen::Device(RECEIVER), Seen::Report(RECEIVER, PUSH_X.to_vec(), true), Seen::Gone]
         );
         assert_eq!(follow_simulated(&[]), []);
+    }
+
+    /// A button press that makes a device the one in use is a press. The buttons it reported while
+    /// another was read are its baseline; the reader keeps them, so the press isn't taken for a
+    /// button already held, as a device's first button report is.
+    #[test]
+    fn a_press_that_takes_over_counts_as_a_press() {
+        let mut layout = Layout::default();
+        layout.buttons[0] =
+            Some(solidcraft_space_mouse::Field { report_id: 3, bit_offset: 0, bits: 1, logical_min: 0, logical_max: 1, relative: false });
+        let (none_down, first_down): (&[u8], &[u8]) = (&[3, 0], &[3, 1]);
+        let receiver: &[(u64, &[u8])] = &[(0, &[]), (10, &[]), (20, &[])];
+        let spacemouse: &[(u64, &[u8])] = &[(5, none_down), (15, first_down), (25, &[])];
+        assert_eq!(
+            follow_simulated_with(layout, &[(RECEIVER, receiver), (SPACEMOUSE, spacemouse)]),
+            [Seen::Device(RECEIVER), Seen::Device(SPACEMOUSE), Seen::Baseline(0), Seen::Report(SPACEMOUSE, first_down.to_vec(), true), Seen::Gone,]
+        );
+        // What the reader does with that: the press after the baseline is a tap.
+        let mut reading = Reading { buttons_known: false, ..Reading::new(Instant::now()) };
+        reading.set_buttons(0);
+        assert!(decode_report(first_down, layout, &mut reading, Instant::now()));
+        assert_eq!((reading.buttons, reading.taps), (1, 1));
+        // Without one, the same report is the baseline: held, not pressed.
+        let mut unseen = Reading { buttons_known: false, ..Reading::new(Instant::now()) };
+        assert!(decode_report(first_down, layout, &mut unseen, Instant::now()));
+        assert_eq!((unseen.buttons, unseen.taps), (1, 0));
     }
 
     #[test]
